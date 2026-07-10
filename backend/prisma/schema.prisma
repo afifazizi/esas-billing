@@ -1,0 +1,214 @@
+// ─── ESAS Prisma Schema ───
+// SQLite for local development. PostgreSQL-ready for production.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                 String    @id @default(uuid())
+  username           String    @unique
+  password           String
+  userRole           String    @default("user")
+  email              String    @unique
+  fullname           String
+  mustChangePassword Boolean   @default(false)
+  custId             String?
+  isActive           Boolean   @default(true)
+  lastLoginAt        DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  customer           Customer? @relation(fields: [custId], references: [custId], onDelete: Restrict)
+  auditLogs          AuditLog[]
+  importRuns         ImportRun[]
+
+  @@index([custId])
+  @@index([userRole])
+  @@map("user")
+}
+
+model Customer {
+  id              String       @id @default(uuid())
+  custId          String       @unique
+  custName        String
+  custDescription String?
+  registeredAt    DateTime?
+  contractEndAt   DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  deletedAt       DateTime?
+
+  departments     Department[]
+  prices          Price[]
+  reports         Report[]
+  breakdowns      Breakdown[]
+  importRuns      ImportRun[]
+  users           User[]
+
+  @@map("customer")
+}
+
+model Price {
+  id            String    @id @default(uuid())
+  custId        String
+  label         String?
+  price         Float
+  effectiveFrom DateTime?
+  effectiveTo   DateTime?
+  isDefault     Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  customer      Customer  @relation(fields: [custId], references: [custId], onDelete: Cascade)
+  reports       Report[]
+
+  @@map("price")
+}
+
+model Department {
+  id        String   @id @default(uuid())
+  deptId    String   @unique
+  deptName  String
+  deptDesc  String?
+  custId    String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  customer  Customer  @relation(fields: [custId], references: [custId], onDelete: Cascade)
+  folders   Folder[]
+
+  @@map("department")
+}
+
+model Folder {
+  id              String    @id @default(uuid())
+  folderId        String    @unique
+  folderDirectory String
+  folderName      String
+  folderDesc      String?
+  folderShortName String?
+  deptId          String
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  department      Department @relation(fields: [deptId], references: [deptId], onDelete: Cascade)
+  reports         Report[]
+  unmatchedDirs   UnmatchedDirectory[]
+
+  @@map("folder")
+}
+
+model Report {
+  id           String    @id @default(uuid())
+  folderId     String
+  usageSize    BigInt
+  month        String
+  year         String
+  pricePerGb   Float
+  priceId      String?
+  fileHash     String
+  fileName     String?
+  folderDir    String?
+  dirCount     Int       @default(0)
+  fileCount    Int       @default(0)
+  adsCount     Int       @default(0)
+  otherCount   Int       @default(0)
+  custId       String
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  deletedAt    DateTime?
+
+  folder       Folder    @relation(fields: [folderId], references: [folderId], onDelete: Cascade)
+  customer     Customer  @relation(fields: [custId], references: [custId], onDelete: Cascade)
+  price        Price?    @relation(fields: [priceId], references: [id], onDelete: SetNull)
+
+  @@index([folderId, month, year, fileHash])
+  @@index([custId, month, year])
+  @@map("report")
+}
+
+model Breakdown {
+  id         String   @id @default(uuid())
+  unit       String
+  usageSize  Int
+  month      String
+  year       String
+  custId     String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  customer   Customer @relation(fields: [custId], references: [custId], onDelete: Cascade)
+
+  @@index([custId, month, year])
+  @@index([unit, custId, month, year])
+  @@map("breakdown")
+}
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  userId      String
+  action      String
+  entityType  String
+  entityId    String
+  oldValue    String?
+  newValue    String?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([entityType, entityId])
+  @@map("audit_log")
+}
+
+model ImportRun {
+  id             String          @id @default(uuid())
+  userId         String
+  fileName       String
+  fileHash       String
+  month          String
+  year           String
+  custId         String?
+  matchedCount   Int             @default(0)
+  unmatchedCount Int             @default(0)
+  insertedCount  Int             @default(0)
+  skippedCount   Int             @default(0)
+  status         String          @default("SUCCESS")
+  errorSummary   String?
+  createdAt      DateTime        @default(now())
+
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  customer       Customer?       @relation(fields: [custId], references: [custId], onDelete: SetNull)
+  unmatchedDirs  UnmatchedDirectory[]
+
+  @@index([userId, createdAt])
+  @@index([custId, month, year])
+  @@map("import_run")
+}
+
+model UnmatchedDirectory {
+  id             String    @id @default(uuid())
+  importRunId    String
+  directoryPath  String
+  sizeBytes      BigInt
+  fileCount      Int       @default(0)
+  status         String    @default("PENDING")
+  mappedFolderId String?
+  createdAt      DateTime  @default(now())
+
+  importRun      ImportRun @relation(fields: [importRunId], references: [id], onDelete: Cascade)
+  mappedFolder   Folder?   @relation(fields: [mappedFolderId], references: [folderId], onDelete: SetNull)
+
+  @@index([importRunId])
+  @@index([status])
+  @@map("unmatched_directory")
+}

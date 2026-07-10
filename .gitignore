@@ -1,0 +1,71 @@
+# ESAS repository hygiene
+
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/versions
+
+# build output
+.next/
+out/
+build/
+dist/
+coverage/
+*.tsbuildinfo
+
+# local env / secrets
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.pem
+*.key
+*.crt
+
+# databases and backups
+*.db
+*.db-*
+*.db.*
+*.sqlite
+*.sqlite3
+*.bak
+*.dump
+*.sql
+
+# uploads / runtime data
+uploads/
+backend/uploads/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# local Hermes/runtime metadata
+.hermes/
+.DS_Store
+Thumbs.db
+
+# legacy PHP source is kept locally as an external reference clone
+legacy-source/
+
+# local one-off diagnostics / generated verification files
+backend/check-db.mjs
+backend/diag.mjs
+backend/hermes-verify.mjs
+backend/restore-customer.mjs
+backend/run-tests.mjs
+backend/test-data.csv
+backend/test-endpoints.sh
+backend/test-import-flow.mjs
+backend/test-import.mjs
+backend/test-import2.mjs
+backend/verify-import.mjs
+
+# nested repo metadata, if present locally
+frontend/.git/
