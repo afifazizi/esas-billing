@@ -6,7 +6,7 @@ export const analyticsRouter = Router();
 analyticsRouter.use(authenticate);
 analyticsRouter.use((req, res, next) => {
   if (req.user?.role !== 'customer_viewer') return next();
-  const allowed = req.method === 'GET' && ['/report-availability', '/report-detail', '/customer-usage-comparison'].includes(req.path);
+  const allowed = req.method === 'GET' && ['/report-availability', '/report-detail', '/customer-usage-comparison', '/customer-yearly-summary'].includes(req.path);
   if (!allowed) return res.status(403).json({ error: 'Customer users can only view their own usage' });
   if (!req.user.custId) return res.status(403).json({ error: 'Customer scope is required' });
   next();
@@ -607,6 +607,111 @@ analyticsRouter.get('/customer-usage-comparison', async (req, res, next) => {
       months: [...byPeriod.values()],
       clusters: [...clusterMap.values()].sort((a, b) => a.cluster.localeCompare(b.cluster)),
       workflowFolders: [...folderMap.values()].sort((a, b) => a.cluster.localeCompare(b.cluster) || a.workflowFolder.localeCompare(b.workflowFolder)),
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/analytics/customer-yearly-summary
+// Customer-safe, full-year dashboard data. Customer viewers are always scoped
+// to the custId embedded in their access token; internal users must explicitly
+// select a customer so this endpoint can never return cross-customer totals.
+analyticsRouter.get('/customer-yearly-summary', async (req, res, next) => {
+  try {
+    const year = getYearParam(req);
+    const hasRequestedCustomer = String(req.query.cust_id || '').trim().length > 0;
+    if (req.user?.role !== 'customer_viewer' && !hasRequestedCustomer) {
+      return res.status(400).json({ error: 'cust_id is required' });
+    }
+
+    const custId = await getEffectiveCustomerId(req);
+    const customer = await prisma.customer.findFirst({
+      where: { custId, deletedAt: null },
+      select: { custId: true, custName: true },
+    });
+    if (!customer) return res.status(404).json({ error: 'Customer not found' });
+
+    const [availableYearRows, monthlyRows, reports] = await Promise.all([
+      prisma.report.groupBy({
+        by: ['year'],
+        where: { custId, deletedAt: null },
+        orderBy: { year: 'desc' },
+      }),
+      prisma.report.groupBy({
+        by: ['month'],
+        where: { custId, year, deletedAt: null },
+        _sum: { usageSize: true, fileCount: true },
+        _count: { _all: true },
+        orderBy: { month: 'asc' },
+      }),
+      prisma.report.findMany({
+        where: { custId, year, deletedAt: null },
+        select: {
+          usageSize: true,
+          fileCount: true,
+          folderId: true,
+          folder: { select: { folderName: true, department: { select: { deptName: true } } } },
+        },
+      }),
+    ]);
+
+    const monthlyFacts = new Map(monthlyRows.map((row) => [row.month, row]));
+    const months = MONTHS.map((month) => {
+      const row = monthlyFacts.get(month);
+      const usageBytes = row?._sum.usageSize || 0n;
+      return {
+        year,
+        month,
+        usageBytes: String(usageBytes),
+        usageGb: bytesToGb(usageBytes),
+        fileCount: row?._sum.fileCount || 0,
+        reportRows: row?._count._all || 0,
+      };
+    });
+
+    const clusters = new Map();
+    const workflowFolders = new Map();
+    for (const report of reports) {
+      const usageBytes = BigInt(report.usageSize || 0n);
+      const fileCount = report.fileCount || 0;
+      const cluster = report.folder.department.deptName;
+      const workflowFolder = `${cluster} - ${report.folder.folderName}`;
+      const add = (map, key, identity) => {
+        const value = map.get(key) || { ...identity, usageBytes: 0n, fileCount: 0, reportRows: 0 };
+        value.usageBytes += usageBytes;
+        value.fileCount += fileCount;
+        value.reportRows += 1;
+        map.set(key, value);
+      };
+      add(clusters, cluster, { cluster });
+      add(workflowFolders, report.folderId, { cluster, workflowFolder });
+    }
+
+    const formatSummary = (values) => values
+      .map((value) => {
+        const { usageBytes, ...identity } = value;
+        return { ...identity, usageBytes: String(usageBytes), usageGb: bytesToGb(usageBytes) };
+      })
+      .sort((a, b) => b.usageGb - a.usageGb || a.cluster.localeCompare(b.cluster) || (a.workflowFolder || '').localeCompare(b.workflowFolder || ''));
+
+    const totalUsageBytes = months.reduce((sum, month) => sum + BigInt(month.usageBytes), 0n);
+    const totalFileCount = months.reduce((sum, month) => sum + month.fileCount, 0);
+    const totalReportRows = months.reduce((sum, month) => sum + month.reportRows, 0);
+
+    res.json({
+      customer: { custId: customer.custId, name: customer.custName },
+      selectedYear: year,
+      availableYears: availableYearRows.map((row) => row.year),
+      totals: {
+        usageBytes: String(totalUsageBytes),
+        usageGb: bytesToGb(totalUsageBytes),
+        fileCount: totalFileCount,
+        reportRows: totalReportRows,
+      },
+      months,
+      clusters: formatSummary([...clusters.values()]),
+      workflowFolders: formatSummary([...workflowFolders.values()]),
     });
   } catch (err) {
     next(err);

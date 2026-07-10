@@ -15,6 +15,7 @@ import {
   UploadCloud,
   Link2Off,
   BarChart3,
+  GitCompareArrows,
 } from 'lucide-react';
 import { ThemeToggle } from './ThemeToggle';
 import { BrandLogo } from '@/components/BrandLogo';
@@ -29,7 +30,8 @@ const internalNavItems = [
 ];
 
 const customerNavItems = [
-  { href: '/dashboard/my-usage', label: 'My Usage', icon: BarChart3 },
+  { href: '/dashboard/my-usage', label: 'My Usage', icon: BarChart3, exact: true },
+  { href: '/dashboard/my-usage/comparison', label: 'Comparison', icon: GitCompareArrows },
 ];
 
 export default function DashboardLayout({
@@ -46,7 +48,7 @@ export default function DashboardLayout({
       router.push('/login');
       return;
     }
-    if (!loading && user?.userRole === 'customer_viewer' && pathname !== '/dashboard/my-usage' && pathname !== '/dashboard/profile') {
+    if (!loading && user?.userRole === 'customer_viewer' && pathname !== '/dashboard/my-usage' && pathname !== '/dashboard/my-usage/comparison' && pathname !== '/dashboard/profile') {
       router.push('/dashboard/my-usage');
     }
   }, [user, loading, router, pathname]);
@@ -62,15 +64,15 @@ export default function DashboardLayout({
   if (!user) return null;
 
   return (
-    <div className="flex min-h-screen bg-[var(--color-bg)]">
+    <div className="flex min-h-screen flex-col bg-[var(--color-bg)] md:flex-row">
       {/* Sidebar */}
-      <aside className="w-64 bg-[var(--color-surface)] border-r border-[var(--color-border)] flex flex-col shrink-0 sticky top-0 h-screen overflow-y-auto">
+      <aside className="sticky top-0 z-10 flex h-auto w-full shrink-0 flex-col border-b border-[var(--color-border)] bg-[var(--color-surface)] md:h-screen md:w-64 md:border-r md:border-b-0 md:overflow-y-auto">
         <div className="border-b border-[var(--color-border)] p-4">
           <Link href={user.userRole === 'customer_viewer' ? '/dashboard/my-usage' : '/dashboard'} className="block" aria-label="ESAS Billing dashboard">
             <BrandLogo className="w-full" imageClassName="rounded-lg" loading="eager" />
           </Link>
         </div>
-        <nav className="flex-1 p-3 space-y-1">
+        <nav className="flex flex-1 gap-1 overflow-x-auto p-3 md:block md:space-y-1">
           {(user.userRole === 'customer_viewer' ? customerNavItems : internalNavItems).map((item) => {
             if ('adminOnly' in item && item.adminOnly && user.userRole !== 'admin') return null;
             const Icon = item.icon;
@@ -82,7 +84,7 @@ export default function DashboardLayout({
               <Link
                 key={item.href}
                 href={item.href}
-                className={`flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors ${
+                className={`flex shrink-0 items-center gap-3 rounded-md px-3 py-2 text-sm transition-colors ${
                   active
                     ? 'bg-amber-600/10 text-[var(--color-amber-text)] border border-amber-600/30'
                     : 'text-[var(--color-muted)] hover:text-[var(--color-text)] hover:bg-[var(--color-hover)]'
@@ -120,12 +122,12 @@ export default function DashboardLayout({
         </nav>
         <div className="p-3 border-t border-[var(--color-border)]">
           <ThemeToggle />
-          <div className="flex items-center gap-2 px-3 py-2 mb-2 mt-3">
+          <div className="mb-2 mt-3 flex items-center gap-2 px-3 py-2">
             <div className="w-7 h-7 rounded-full bg-amber-600/20 flex items-center justify-center text-[var(--color-amber-text)] text-xs font-bold">
               {user.username[0].toUpperCase()}
             </div>
             <div className="flex-1 min-w-0">
-              <p className="text-sm text-[var(--color-text)] truncate">{user.fullname}</p>
+              <p className="break-words text-sm text-[var(--color-text)]">{user.fullname}</p>
               <p className="text-xs text-[var(--color-subtle)]">{user.userRole}</p>
             </div>
           </div>
@@ -140,8 +142,8 @@ export default function DashboardLayout({
       </aside>
 
       {/* Main content */}
-      <main className="flex-1 overflow-auto">
-        <div className="p-6">{children}</div>
+      <main className="min-w-0 flex-1 overflow-auto">
+        <div className="p-4 sm:p-6">{children}</div>
       </main>
     </div>
   );
