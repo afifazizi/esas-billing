@@ -2,11 +2,13 @@ import { Router } from 'express';
 import PDFDocument from 'pdfkit';
 import prisma from '../db.js';
 import { authenticate } from '../middleware/auth.js';
+import { billableUsageBytes, billableUsageGb, exactBillableUsageGb, sumBillableUsageBytes } from '../utils/usageThreshold.js';
+import { renderPdf } from '../utils/pdfLayout.js';
+import { buildPdfPayloadForCustomer } from '../utils/pdfPayload.js';
+import * as pdfCharts from '../utils/pdfCharts.js';
 
 export const exportRouter = Router();
 exportRouter.use(authenticate);
-
-const BYTES_PER_GB = 1073741824;
 
 async function resolveExportCustomerId(req, custId) {
   const requested = String(custId || '').trim();
@@ -38,10 +40,6 @@ async function validatePeriodQuery(req) {
     throw err;
   }
   return { custId: await resolveExportCustomerId(req, cust_id), month: m, year: y, fileName: file_name ? String(file_name) : null };
-}
-
-function bytesToGb(bytes) {
-  return Math.ceil(Number(bytes || 0n) / BYTES_PER_GB);
 }
 
 function money(value) {
@@ -82,10 +80,13 @@ async function getReportExportData({ custId, month, year, fileName }) {
     }),
   ]);
 
-  const totalBytes = reports.reduce((sum, report) => sum + BigInt(report.usageSize || 0n), 0n);
+  const totalBytes = sumBillableUsageBytes(reports, (report) => report.usageSize);
   const pricePerGb = Number(customer?.prices[0]?.price || reports[0]?.pricePerGb || 0);
-  const totalUsageGb = reports.reduce((sum, report) => sum + bytesToGb(report.usageSize), 0);
-  const totalRevenue = (Number(totalBytes) / BYTES_PER_GB) * pricePerGb;
+  const totalUsageGb = billableUsageGb(totalBytes);
+  const totalRevenue = reports.reduce(
+    (sum, report) => sum + exactBillableUsageGb(report.usageSize) * Number(report.pricePerGb),
+    0,
+  );
 
   const isilon = reports.map((report, index) => ({
     no: index + 1,
@@ -98,21 +99,27 @@ async function getReportExportData({ custId, month, year, fileName }) {
     fileCount: report.fileCount,
     adsCount: report.adsCount,
     otherCount: report.otherCount,
-    physicalSize: String(report.usageSize),
-    sizeGb: bytesToGb(report.usageSize),
+    physicalSize: String(billableUsageBytes(report.usageSize)),
+    sizeGb: billableUsageGb(report.usageSize),
+    pricePerGb: Number(report.pricePerGb),
   }));
 
   const workfolderMap = new Map();
   const departmentMap = new Map();
   for (const row of isilon) {
-    workfolderMap.set(row.workflowFolder, (workfolderMap.get(row.workflowFolder) || 0) + row.sizeGb);
-    departmentMap.set(row.department, (departmentMap.get(row.department) || 0) + row.sizeGb);
+    const usageBytes = BigInt(row.physicalSize);
+    workfolderMap.set(row.workflowFolder, (workfolderMap.get(row.workflowFolder) || 0n) + usageBytes);
+    departmentMap.set(row.department, (departmentMap.get(row.department) || 0n) + usageBytes);
   }
   const workfolderSummary = [...workfolderMap.entries()]
-    .map(([folderName, sizeGb]) => ({ folderName, sizeGb }))
+    .map(([folderName, usageBytes]) => ({ folderName, sizeGb: billableUsageGb(usageBytes) }))
     .sort((a, b) => b.sizeGb - a.sizeGb);
   const departmentalSummary = [...departmentMap.entries()]
-    .map(([deptName, sizeGb]) => ({ deptName, sizeGb, sharePct: totalUsageGb ? Math.round((sizeGb / totalUsageGb) * 10000) / 100 : 0 }))
+    .map(([deptName, usageBytes]) => ({
+      deptName,
+      sizeGb: billableUsageGb(usageBytes),
+      sharePct: totalBytes ? Math.round((Number(usageBytes) / Number(totalBytes)) * 10000) / 100 : 0,
+    }))
     .sort((a, b) => b.sizeGb - a.sizeGb);
 
   return {
@@ -146,319 +153,100 @@ async function getReportExportData({ custId, month, year, fileName }) {
   };
 }
 
-function drawText(doc, text, x, y, options = {}) {
-  doc.text(String(text ?? ''), x, y, options);
+// ─── Template v9 payload assembly ───────────────────────────────────────────
+// Extends getReportExportData with the historical dataset required by
+// sections 5.1-5.6 (same-customer rows for the selected year) and the
+// folder-config count for 1.1 Data Validation.
+
+export function buildTemplateCurrentReports(isilonRows, month) {
+  return isilonRows.map((row) => ({
+    reportId: row.id,
+    folderId: row.id,
+    usageSize: BigInt(row.physicalSize),
+    pricePerGb: Number(row.pricePerGb || 0),
+    month,
+    clusterName: row.department,
+    pathLabel: row.workflowFolder,
+  }));
 }
 
-function addPageIfNeeded(doc, y, needed = 80) {
-  if (y + needed < doc.page.height - doc.page.margins.bottom) return y;
-  doc.addPage();
-  return doc.page.margins.top;
-}
+async function getTemplateV9Payload(query) {
+  const base = await getReportExportData(query);
+  const folderWhere = { department: { custId: query.custId }, deletedAt: null };
+  const [yearRows, folderCount] = await Promise.all([
+    prisma.report.findMany({
+      where: { custId: query.custId, year: query.year, deletedAt: null, ...(query.fileName && query.fileName !== '1' ? { fileName: query.fileName } : {}) },
+      include: { folder: { include: { department: true } } },
+      orderBy: [{ month: 'asc' }, { createdAt: 'asc' }],
+    }),
+    prisma.folder.count({ where: folderWhere }),
+  ]);
 
-function drawRule(doc, y) {
-  doc.moveTo(50, y).lineTo(545, y).strokeColor('#D9DEE7').lineWidth(0.8).stroke();
-}
+  const historyRows = yearRows.map((row) => ({
+    year: row.year,
+    month: row.month,
+    folderId: row.folderId,
+    usageSize: row.usageSize,
+    pricePerGb: row.pricePerGb,
+    clusterName: row.folder.department.deptName,
+    pathLabel: `${row.folder.department.deptName} - ${row.folder.folderName}`,
+  }));
 
-function drawSummaryCard(doc, x, y, label, value, accent = '#111827', width = 155) {
-  doc.roundedRect(x, y, width, 54, 6).fillAndStroke('#F8FAFC', '#D9DEE7');
-  doc.fillColor('#6B7280').fontSize(7).font('Helvetica').text(label, x + 10, y + 10, { width: width - 20 });
-  doc.fillColor(accent).fontSize(13).font('Helvetica-Bold').text(value, x + 10, y + 28, { width: width - 20 });
-}
+  const reports = buildTemplateCurrentReports(base.isilon, query.month);
 
-function truncateLabel(value, maxLength = 34) {
-  const text = String(value ?? '');
-  return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
-}
-
-function formatChartValue(value) {
-  const gb = Number(value || 0);
-  if (Math.abs(gb) >= 1024) return `${(gb / 1024).toFixed(1)} TB`;
-  return `${gb.toLocaleString()} GB`;
-}
-
-function drawChartFrame(doc, x, y, width, height) {
-  doc.roundedRect(x, y, width, height, 6).fillAndStroke('#FFFFFF', '#D9DEE7');
-}
-
-function drawHorizontalBarChart(doc, { y, title, subtitle, rows, labelKey, valueKey, barColor = '#2F9E44', maxRows = 12 }) {
-  const limitedRows = rows.slice(0, maxRows);
-  const rowHeight = 22;
-  const chartHeight = Math.max(96, limitedRows.length * rowHeight + 58);
-  y = addPageIfNeeded(doc, y, chartHeight + 24);
-
-  doc.fillColor('#111827').font('Helvetica-Bold').fontSize(11).text(title, 50, y);
-  doc.fillColor('#6B7280').font('Helvetica').fontSize(8).text(subtitle, 50, y + 14);
-  y += 30;
-
-  drawChartFrame(doc, 50, y, 495, chartHeight);
-  if (!limitedRows.length) {
-    doc.fillColor('#6B7280').font('Helvetica').fontSize(9).text('No data available', 50, y + 38, { width: 495, align: 'center' });
-    return y + chartHeight + 22;
-  }
-
-  const maxValue = Math.max(...limitedRows.map((row) => Number(row[valueKey] || 0)), 1);
-  const labelX = 66;
-  const barX = 222;
-  const barWidth = 230;
-  const valueX = 462;
-  let rowY = y + 36;
-
-  doc.fillColor('#6B7280').font('Helvetica').fontSize(7).text('0', barX, y + 18);
-  doc.text(formatChartValue(maxValue), barX + barWidth - 60, y + 18, { width: 60, align: 'right' });
-  doc.moveTo(barX, y + 30).lineTo(barX + barWidth, y + 30).strokeColor('#E5E7EB').lineWidth(0.5).stroke();
-
-  for (const row of limitedRows) {
-    const value = Number(row[valueKey] || 0);
-    const width = Math.max(1, (value / maxValue) * barWidth);
-    doc.fillColor('#374151').font('Helvetica').fontSize(7).text(truncateLabel(row[labelKey]), labelX, rowY + 3, { width: 145 });
-    doc.roundedRect(barX, rowY + 2, barWidth, 12, 3).fill('#EEF2F7');
-    doc.roundedRect(barX, rowY + 2, width, 12, 3).fill(barColor);
-    doc.fillColor('#111827').font('Helvetica-Bold').fontSize(7).text(value.toLocaleString(), valueX, rowY + 2, { width: 55, align: 'right' });
-    rowY += rowHeight;
-  }
-
-  if (rows.length > maxRows) {
-    doc.fillColor('#6B7280').font('Helvetica-Oblique').fontSize(7)
-      .text(`Showing top ${maxRows} of ${rows.length} workflow folders by usage.`, 66, y + chartHeight - 18, { width: 450 });
-  }
-  return y + chartHeight + 22;
-}
-
-function drawVerticalBarChart(doc, { y, title, subtitle, rows, labelKey, valueKey, barColor = '#D2991D', maxRows = 8 }) {
-  const limitedRows = rows.slice(0, maxRows);
-  const chartHeight = 210;
-  y = addPageIfNeeded(doc, y, chartHeight + 54);
-
-  doc.fillColor('#111827').font('Helvetica-Bold').fontSize(11).text(title, 50, y);
-  doc.fillColor('#6B7280').font('Helvetica').fontSize(8).text(subtitle, 50, y + 14);
-  y += 30;
-
-  drawChartFrame(doc, 50, y, 495, chartHeight);
-  if (!limitedRows.length) {
-    doc.fillColor('#6B7280').font('Helvetica').fontSize(9).text('No data available', 50, y + 82, { width: 495, align: 'center' });
-    return y + chartHeight + 22;
-  }
-
-  const maxValue = Math.max(...limitedRows.map((row) => Number(row[valueKey] || 0)), 1);
-  const originX = 78;
-  const originY = y + 160;
-  const plotWidth = 405;
-  const plotHeight = 112;
-  const gap = 12;
-  const barWidth = Math.max(18, Math.min(42, (plotWidth - gap * (limitedRows.length - 1)) / limitedRows.length));
-
-  doc.strokeColor('#E5E7EB').lineWidth(0.5);
-  for (let i = 0; i <= 4; i += 1) {
-    const gridY = originY - (plotHeight * i) / 4;
-    doc.moveTo(originX, gridY).lineTo(originX + plotWidth, gridY).stroke();
-  }
-  doc.fillColor('#6B7280').font('Helvetica').fontSize(7)
-    .text(formatChartValue(maxValue), originX + plotWidth + 4, originY - plotHeight - 4, { width: 40 })
-    .text('0', originX + plotWidth + 4, originY - 4, { width: 40 });
-
-  limitedRows.forEach((row, index) => {
-    const value = Number(row[valueKey] || 0);
-    const height = Math.max(1, (value / maxValue) * plotHeight);
-    const x = originX + index * (barWidth + gap);
-    const barY = originY - height;
-    doc.roundedRect(x, barY, barWidth, height, 3).fill(barColor);
-    doc.fillColor('#111827').font('Helvetica-Bold').fontSize(7)
-      .text(formatChartValue(value), x - 8, barY - 12, { width: barWidth + 16, align: 'center' });
-    doc.fillColor('#374151').font('Helvetica').fontSize(7)
-      .text(truncateLabel(row[labelKey], 14), x - 12, originY + 8, { width: barWidth + 24, align: 'center' });
+  return buildPdfPayloadForCustomer({
+    customer: { custName: base.customer, prices: [{ price: base.pricePerGb }] },
+    custId: query.custId,
+    month: query.month,
+    year: query.year,
+    reports,
+    folderCount,
+    pendingUnmatched: base.pendingUnmatched,
+    generatedAt: base.generatedAt,
+    historyRows,
   });
-
-  if (rows.length > maxRows) {
-    doc.fillColor('#6B7280').font('Helvetica-Oblique').fontSize(7)
-      .text(`Showing top ${maxRows} of ${rows.length} clusters by usage.`, 66, y + chartHeight - 18, { width: 450 });
-  }
-  return y + chartHeight + 22;
 }
 
-function drawTable(doc, { y, title, columns, rows, rowHeight = 18, maxRows = Infinity }) {
-  y = addPageIfNeeded(doc, y, 48);
-  doc.fillColor('#111827').font('Helvetica-Bold').fontSize(11).text(title, 50, y);
-  y += 18;
-  doc.roundedRect(50, y, 495, rowHeight, 3).fill('#111827');
-  doc.fillColor('#FFFFFF').font('Helvetica-Bold').fontSize(7);
-  let x = 58;
-  for (const col of columns) {
-    doc.text(col.label, x, y + 6, { width: col.width, align: col.align || 'left' });
-    x += col.width;
-  }
-  y += rowHeight;
-  doc.font('Helvetica').fontSize(7).fillColor('#111827');
-  const limitedRows = rows.slice(0, maxRows);
-  limitedRows.forEach((row, idx) => {
-    y = addPageIfNeeded(doc, y, rowHeight + 22);
-    if (idx % 2 === 0) doc.rect(50, y, 495, rowHeight).fill('#F8FAFC');
-    doc.fillColor('#111827');
-    x = 58;
-    for (const col of columns) {
-      doc.text(String(row[col.key] ?? ''), x, y + 5, { width: col.width, align: col.align || 'left', ellipsis: true });
-      x += col.width;
-    }
-    y += rowHeight;
-  });
-  if (rows.length > maxRows) {
-    y += 4;
-    doc.fillColor('#6B7280').font('Helvetica-Oblique').fontSize(7).text(`Showing first ${maxRows} of ${rows.length} rows. Export Excel for the complete table.`, 50, y);
-    y += 14;
-  }
-  return y + 16;
+export function buildExcelSheets(data) {
+  return {
+    summary: {
+      name: 'Summary',
+      headers: ['Customer', 'Month/Year', 'Status', 'Report Rows', 'Total Usage (GB)', 'Price per GB (RM)', 'Total Revenue (RM)', 'Pending Unmatched'],
+      rows: [[data.customer, data.period, data.status, data.rowCount, data.totalUsageGb, data.pricePerGb, data.totalRevenue, data.pendingUnmatched]],
+    },
+    report: {
+      name: 'Isilon Report',
+      headers: ['No', 'Cluster', 'Workflow Folder', 'Directory', 'Dir Count', 'File Count', 'ADS Count', 'Other Count', 'Physical Size (Bytes)', 'Size (GB)'],
+      rows: data.isilon.map((row) => [row.no, row.cluster, row.workflowFolder, row.directory, row.dirCount, row.fileCount, row.adsCount, row.otherCount, row.physicalSize, row.sizeGb]),
+    },
+    workfolder: {
+      name: 'Workfolder Summary',
+      headers: ['Workflow Folder', 'Size (GB)'],
+      rows: data.workfolderSummary.map((row) => [row.folderName, row.sizeGb]),
+    },
+    department: {
+      name: 'Cluster Summary',
+      headers: ['Cluster', 'Size (GB)', 'Share %'],
+      rows: data.departmentalSummary.map((row) => [row.deptName, row.sizeGb, row.sharePct]),
+    },
+  };
 }
 
-export function streamPdf(res, payload) {
-  const doc = new PDFDocument({ size: 'A4', margin: 50, bufferPages: true });
-  const safeCustomer = sanitizeFilePart(payload.customer);
-  const filename = `esas-report-${safeCustomer}-${payload.year}-${payload.month}.pdf`;
-
-  res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  doc.pipe(res);
-
-  doc.fillColor('#111827').font('Helvetica-Bold').fontSize(20).text(payload.title, 50, 48);
-  doc.font('Helvetica').fontSize(10).fillColor('#4B5563').text(`Customer: ${payload.customer}`, 50, 78);
-  doc.text(`Period: ${payload.period}`, 50, 94);
-  doc.text(`Generated: ${new Date(payload.generatedAt).toLocaleString('en-MY')}`, 50, 110);
-  doc.roundedRect(430, 54, 92, 28, 14).fill(payload.status === 'DRAFT' ? '#FEF3C7' : '#E5E7EB');
-  doc.fillColor(payload.status === 'DRAFT' ? '#92400E' : '#374151').font('Helvetica-Bold').fontSize(9).text(payload.status, 430, 64, { width: 92, align: 'center' });
-  drawRule(doc, 138);
-
-  drawSummaryCard(doc, 50, 156, 'TOTAL USAGE', `${payload.totalUsageGb.toLocaleString()} GB`, '#0F766E');
-  drawSummaryCard(doc, 220, 156, 'PRICE PER GB', `RM ${payload.pricePerGb}`, '#B45309');
-  drawSummaryCard(doc, 390, 156, 'TOTAL REVENUE', `RM ${money(payload.totalRevenue)}`, '#047857');
-
-  let y = 236;
-  doc.fillColor('#111827').font('Helvetica-Bold').fontSize(12).text('Report Validation', 50, y);
-  y += 18;
-  const validationRows = [
-    `Rows in report: ${payload.rowCount}`,
-    `Pending unmatched paths: ${payload.pendingUnmatched}`,
-    payload.latestImport ? `Latest import: ${payload.latestImport.fileName} (${payload.latestImport.status})` : 'Latest import: none recorded',
-  ];
-  doc.font('Helvetica').fontSize(9).fillColor('#374151');
-  validationRows.forEach((line) => { doc.text(`• ${line}`, 58, y); y += 14; });
-  y += 8;
-
-  if (!payload.isilon.length) {
-    doc.fillColor('#991B1B').font('Helvetica-Bold').fontSize(11).text('No Isilon report data exists for this customer and period.', 50, y);
-    doc.end();
-    return;
-  }
-
-  y = drawHorizontalBarChart(doc, {
-    y,
-    title: '2.1 Workfolder Summary',
-    subtitle: 'Storage usage by workflow folder (GB)',
-    rows: payload.workfolderSummary,
-    labelKey: 'folderName',
-    valueKey: 'sizeGb',
-    barColor: '#39D353',
-    maxRows: 12,
-  });
-
-  y = drawVerticalBarChart(doc, {
-    y,
-    title: '2.2 Cluster Summary',
-    subtitle: 'Storage usage by cluster',
-    rows: payload.departmentalSummary,
-    labelKey: 'deptName',
-    valueKey: 'sizeGb',
-    barColor: '#D2991D',
-    maxRows: 8,
-  });
-
-  y = drawTable(doc, {
-    y,
-    title: 'Isilon Report',
-    columns: [
-      { key: 'no', label: 'No', width: 24 },
-      { key: 'cluster', label: 'Cluster', width: 120 },
-      { key: 'workflowFolder', label: 'Workflow Folder', width: 210 },
-      { key: 'sizeGb', label: 'Size (GB)', width: 85, align: 'right' },
-    ],
-    rows: payload.isilon.map((row) => ({ ...row, sizeGb: row.sizeGb.toLocaleString() })),
-    maxRows: 40,
-  });
-
-  y = drawTable(doc, {
-    y,
-    title: 'Workfolder Summary',
-    columns: [
-      { key: 'folderName', label: 'Workflow Folder', width: 320 },
-      { key: 'sizeGb', label: 'Size (GB)', width: 110, align: 'right' },
-    ],
-    rows: payload.workfolderSummary.map((row) => ({ ...row, sizeGb: row.sizeGb.toLocaleString() })),
-    maxRows: 25,
-  });
-
-  y = drawTable(doc, {
-    y,
-    title: 'Cluster Summary',
-    columns: [
-      { key: 'deptName', label: 'Cluster', width: 240 },
-      { key: 'sizeGb', label: 'Size (GB)', width: 95, align: 'right' },
-      { key: 'sharePct', label: 'Share %', width: 80, align: 'right' },
-    ],
-    rows: payload.departmentalSummary.map((row) => ({ ...row, sizeGb: row.sizeGb.toLocaleString(), sharePct: `${row.sharePct}%` })),
-  });
-
-
-
-  const range = doc.bufferedPageRange();
-  for (let i = range.start; i < range.start + range.count; i += 1) {
-    doc.switchToPage(i);
-    doc.fillColor('#6B7280').font('Helvetica').fontSize(7)
-      .text(`ESAS Cloud Storage Report • ${payload.customer} • ${payload.period}`, 50, 812, { width: 360 });
-    doc.text(`Page ${i + 1} of ${range.count}`, 470, 812, { width: 75, align: 'right' });
-  }
-
-  doc.end();
-}
-
-// GET /api/export/excel
-// Returns JSON structured for Excel generation (3 sheets: Report, Breakdown, Summary)
+// GET /api/export/excel — structured workbook JSON consumed by the frontend xlsx library.
 exportRouter.get('/excel', async (req, res, next) => {
   try {
-    const query = await validatePeriodQuery(req);
-    const data = await getReportExportData(query);
-
-    res.json({
-      sheets: {
-        summary: {
-          name: 'Summary',
-          headers: ['Customer', 'Month/Year', 'Status', 'Report Rows', 'Total Usage (GB)', 'Price per GB (RM)', 'Total Revenue (RM)', 'Pending Unmatched'],
-          rows: [[data.customer, data.period, data.status, data.rowCount, data.totalUsageGb, data.pricePerGb, data.totalRevenue, data.pendingUnmatched]],
-        },
-        report: {
-          name: 'Isilon Report',
-          headers: ['No', 'Cluster', 'Workflow Folder', 'Directory', 'Dir Count', 'File Count', 'ADS Count', 'Other Count', 'Physical Size (Bytes)', 'Size (GB)'],
-          rows: data.isilon.map((r) => [r.no, r.cluster, r.workflowFolder, r.directory, r.dirCount, r.fileCount, r.adsCount, r.otherCount, r.physicalSize, r.sizeGb]),
-        },
-        workfolder: {
-          name: 'Workfolder Summary',
-          headers: ['Workflow Folder', 'Size (GB)'],
-          rows: data.workfolderSummary.map((r) => [r.folderName, r.sizeGb]),
-        },
-        department: {
-          name: 'Cluster Summary',
-          headers: ['Cluster', 'Size (GB)', 'Share %'],
-          rows: data.departmentalSummary.map((r) => [r.deptName, r.sizeGb, r.sharePct]),
-        },
-      },
-    });
+    const data = await getReportExportData(await validatePeriodQuery(req));
+    res.json({ sheets: buildExcelSheets(data) });
   } catch (err) {
     next(err);
   }
 });
 
 // GET /api/export/pdf-data
-// Returns structured JSON for PDF rendering or integration testing.
+// Returns structured JSON for PDF rendering or integration testing (Template v9).
 exportRouter.get('/pdf-data', async (req, res, next) => {
   try {
-    const data = await getReportExportData(await validatePeriodQuery(req));
+    const data = await getTemplateV9Payload(await validatePeriodQuery(req));
     res.json(data);
   } catch (err) {
     next(err);
@@ -466,11 +254,21 @@ exportRouter.get('/pdf-data', async (req, res, next) => {
 });
 
 // GET /api/export/pdf
-// Streams a formal customer-facing ESAS PDF report.
+// Streams the formal customer-facing ESAS PDF report (Professional Template v9).
 exportRouter.get('/pdf', async (req, res, next) => {
   try {
-    const data = await getReportExportData(await validatePeriodQuery(req));
-    streamPdf(res, data);
+    const query = await validatePeriodQuery(req);
+    const payload = await getTemplateV9Payload(query);
+    const filename = `esas-report-${sanitizeFilePart(payload.customer)}-${payload.year}-${payload.month}.pdf`;
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    const doc = new PDFDocument({ size: 'A4', margin: 50, bufferPages: true, autoFirstPage: false });
+    doc.info.Title = 'Cloud Storage Usage Report';
+    doc.info.Customer = payload.customer;
+    doc.addPage({ size: 'A4', margin: 50 });
+    renderPdf(doc, payload, pdfCharts, null);
+    doc.pipe(res);
+    doc.end();
   } catch (err) {
     next(err);
   }

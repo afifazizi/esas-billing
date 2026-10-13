@@ -1,6 +1,14 @@
 import { Router } from 'express';
 import prisma from '../db.js';
 import { authenticate } from '../middleware/auth.js';
+import {
+  billableUsageBytes,
+  billableUsageFilter,
+  billableUsageGb,
+  exactBillableUsageGb,
+  sumBillableUsageBytes,
+} from '../utils/usageThreshold.js';
+import { buildCustomerYearlyMonths, presentCustomerYearlySummary } from '../services/customerYearlySummary.js';
 
 export const analyticsRouter = Router();
 analyticsRouter.use(authenticate);
@@ -38,7 +46,7 @@ function getMonthParam(req) {
 }
 
 function bytesToGb(bytes) {
-  return Math.ceil(Number(bytes || 0n) / 1073741824);
+  return billableUsageGb(bytes);
 }
 
 
@@ -97,7 +105,7 @@ analyticsRouter.get('/dashboard', async (req, res, next) => {
       prisma.customer.count({ where: { deletedAt: null } }),
       prisma.report.aggregate({
         _sum: { usageSize: true },
-        where: { deletedAt: null, month, year },
+        where: { deletedAt: null, month, year, usageSize: billableUsageFilter() },
       }),
       prisma.report.findMany({
         where: { deletedAt: null, month, year },
@@ -107,11 +115,11 @@ analyticsRouter.get('/dashboard', async (req, res, next) => {
     ]);
 
     const totalUsageBytes = usageResult._sum.usageSize || 0n;
-    const totalUsageGB = Math.ceil(Number(totalUsageBytes) / 1073741824);
+    const totalUsageGB = bytesToGb(totalUsageBytes);
     const totalUsageTB = (Number(totalUsageBytes) / 1099511627776).toFixed(2);
 
     const totalRevenue = revenueResult.reduce((sum, r) => {
-      return sum + (Number(r.usageSize) / 1073741824) * Number(r.pricePerGb);
+      return sum + exactBillableUsageGb(r.usageSize) * Number(r.pricePerGb);
     }, 0);
 
     res.json({
@@ -147,6 +155,7 @@ analyticsRouter.get('/usage-by-customer', async (req, res, next) => {
           month: m,
           year: y,
           deletedAt: null,
+          usageSize: billableUsageFilter(),
         },
       });
       return {
@@ -181,7 +190,7 @@ analyticsRouter.get('/usage-by-customer-monthly', async (req, res, next) => {
       }),
       prisma.report.groupBy({
         by: ['custId', 'month'],
-        where: { year, deletedAt: null },
+        where: { year, deletedAt: null, usageSize: billableUsageFilter() },
         _sum: { usageSize: true },
       }),
     ]);
@@ -228,7 +237,7 @@ analyticsRouter.get('/revenue', async (req, res, next) => {
         where: { year, month: m, deletedAt: null },
         select: { usageSize: true, pricePerGb: true },
       });
-      const totalUsage = reports.reduce((sum, r) => sum + Number(r.usageSize), 0);
+      const totalUsage = reports.reduce((sum, r) => sum + Number(billableUsageBytes(r.usageSize)), 0);
       const price = reports[0]?.pricePerGb || 0;
       return { month: m, year, total_usage: totalUsage, price: Number(price) };
     }));
@@ -247,7 +256,7 @@ analyticsRouter.get('/storage-trend', async (req, res, next) => {
     const result = await Promise.all(MONTHS.map(async (m) => {
       const agg = await prisma.report.aggregate({
         _sum: { usageSize: true },
-        where: { year, month: m, deletedAt: null },
+        where: { year, month: m, deletedAt: null, usageSize: billableUsageFilter() },
       });
       return {
         month: m,
@@ -267,7 +276,7 @@ analyticsRouter.get('/storage-trend', async (req, res, next) => {
 
 function revenueFromReports(reports) {
   return reports.reduce((sum, r) => {
-    return sum + (Number(r.usageSize || 0n) / 1073741824) * Number(r.pricePerGb || 0);
+    return sum + exactBillableUsageGb(r.usageSize) * Number(r.pricePerGb || 0);
   }, 0);
 }
 
@@ -279,11 +288,11 @@ function monthLimitForYear(year) {
 }
 
 async function getYearReportFacts(year) {
-  const [totalCustomers, usageResult, reports, reportMonths, importRuns, pendingUnmatched] = await Promise.all([
+  const [totalCustomers, usageResult, reports, reportMonths, importRuns, pendingUnmatched, reportPeriods] = await Promise.all([
     prisma.customer.count({ where: { deletedAt: null } }),
     prisma.report.aggregate({
       _sum: { usageSize: true },
-      where: { deletedAt: null, year },
+      where: { deletedAt: null, year, usageSize: billableUsageFilter() },
     }),
     prisma.report.findMany({
       where: { deletedAt: null, year },
@@ -301,6 +310,10 @@ async function getYearReportFacts(year) {
     prisma.unmatchedDirectory.count({
       where: { status: 'PENDING', importRun: { year } },
     }),
+    prisma.reportPeriod.findMany({
+      where: { year },
+      select: { custId: true, month: true, status: true },
+    }),
   ]);
 
   const activeCustomerIds = new Set(reports.map((r) => r.custId));
@@ -311,6 +324,9 @@ async function getYearReportFacts(year) {
   const totalRevenue = revenueFromReports(reports);
   const partialImports = importRuns.filter((run) => run.status === 'PARTIAL').length;
   const failedImports = importRuns.filter((run) => run.status === 'FAILED').length;
+  const lifecycleMap = new Map(reportPeriods.map((period) => [`${period.custId}:${period.month}`, period.status]));
+  const awaitingReview = reportMonths.filter((period) => (lifecycleMap.get(`${period.custId}:${period.month}`) || 'DRAFT') === 'DRAFT').length;
+  const awaitingApproval = reportMonths.filter((period) => lifecycleMap.get(`${period.custId}:${period.month}`) === 'REVIEWED').length;
 
   return {
     totalCustomers,
@@ -326,6 +342,8 @@ async function getYearReportFacts(year) {
     pendingUnmatched,
     partialImports,
     failedImports,
+    awaitingReview,
+    awaitingApproval,
   };
 }
 
@@ -338,7 +356,7 @@ analyticsRouter.get('/dashboard-summary', async (req, res, next) => {
 
     const topCustomer = await prisma.report.groupBy({
       by: ['custId'],
-      where: { deletedAt: null, year },
+      where: { deletedAt: null, year, usageSize: billableUsageFilter() },
       _sum: { usageSize: true },
       orderBy: { _sum: { usageSize: 'desc' } },
       take: 1,
@@ -373,7 +391,7 @@ analyticsRouter.get('/top-customers', async (req, res, next) => {
     const limit = Math.min(Math.max(Number(req.query.limit || 5), 1), 10);
     const grouped = await prisma.report.groupBy({
       by: ['custId'],
-      where: { deletedAt: null, year },
+      where: { deletedAt: null, year, usageSize: billableUsageFilter() },
       _sum: { usageSize: true },
       _count: { _all: true },
       orderBy: { _sum: { usageSize: 'desc' } },
@@ -448,7 +466,8 @@ analyticsRouter.get('/attention-items', async (req, res, next) => {
         title: 'Unmatched paths pending review',
         description: `${facts.pendingUnmatched} directory path${facts.pendingUnmatched === 1 ? '' : 's'} need mapping or ignore action.`,
         count: facts.pendingUnmatched,
-        href: '/dashboard/unmatched-directories',
+        href: `/dashboard/unmatched-directories?status=PENDING&year=${year}`,
+        action: { type: 'filter', resource: 'unmatched-directories', filters: { status: 'PENDING', year }, apiHref: `/api/unmatched-directories?status=PENDING&year=${year}` },
       });
     }
 
@@ -459,7 +478,8 @@ analyticsRouter.get('/attention-items', async (req, res, next) => {
         title: 'Partial imports this year',
         description: `${facts.partialImports} upload run${facts.partialImports === 1 ? '' : 's'} completed with unmatched data.`,
         count: facts.partialImports,
-        href: '/dashboard/import-runs',
+        href: `/dashboard/import-runs?status=PARTIAL&year=${year}`,
+        action: { type: 'filter', resource: 'import-runs', filters: { status: 'PARTIAL', year }, apiHref: `/api/import-runs?status=PARTIAL&year=${year}` },
       });
     }
 
@@ -470,7 +490,8 @@ analyticsRouter.get('/attention-items', async (req, res, next) => {
         title: 'Failed imports this year',
         description: `${facts.failedImports} upload run${facts.failedImports === 1 ? '' : 's'} failed and should be investigated.`,
         count: facts.failedImports,
-        href: '/dashboard/import-runs',
+        href: `/dashboard/import-runs?status=FAILED&year=${year}`,
+        action: { type: 'filter', resource: 'import-runs', filters: { status: 'FAILED', year }, apiHref: `/api/import-runs?status=FAILED&year=${year}` },
       });
     }
 
@@ -482,7 +503,32 @@ analyticsRouter.get('/attention-items', async (req, res, next) => {
         title: 'Report coverage below target',
         description: `${facts.uploadedReports}/${facts.expectedReports} expected customer-month reports are present for ${year}.`,
         count: missing,
-        href: '/dashboard/reports',
+        href: `/dashboard/billing?year=${year}&filter=ACTION_REQUIRED`,
+        action: { type: 'filter', resource: 'reports', filters: { year, missing: true } },
+      });
+    }
+
+    if (facts.awaitingReview > 0) {
+      items.push({
+        key: 'awaiting-review',
+        severity: 'info',
+        title: 'Reports awaiting review',
+        description: `${facts.awaitingReview} customer-month report${facts.awaitingReview === 1 ? '' : 's'} are still in DRAFT.`,
+        count: facts.awaitingReview,
+        href: `/dashboard/billing?year=${year}&filter=DRAFT`,
+        action: { type: 'filter', resource: 'report-periods', filters: { year, status: 'DRAFT' } },
+      });
+    }
+
+    if (facts.awaitingApproval > 0) {
+      items.push({
+        key: 'awaiting-approval',
+        severity: 'warning',
+        title: 'Reports awaiting approval',
+        description: `${facts.awaitingApproval} customer-month report${facts.awaitingApproval === 1 ? '' : 's'} are REVIEWED and need admin approval.`,
+        count: facts.awaitingApproval,
+        href: `/dashboard/billing?year=${year}&filter=REVIEWED`,
+        action: { type: 'filter', resource: 'report-periods', filters: { year, status: 'REVIEWED' } },
       });
     }
 
@@ -567,10 +613,9 @@ analyticsRouter.get('/customer-usage-comparison', async (req, res, next) => {
       const key = `${report.year}-${report.month}`;
       const period = byPeriod.get(key);
       if (!period) continue;
-      const sizeGb = bytesToGb(report.usageSize);
-      const usageBytes = BigInt(report.usageSize || 0n);
+      const usageBytes = billableUsageBytes(report.usageSize);
+      const sizeGb = bytesToGb(usageBytes);
       period.totalUsageBytes = String(BigInt(period.totalUsageBytes) + usageBytes);
-      period.totalUsageGb += sizeGb;
       period.totalFileCount += report.fileCount || 0;
       period.reportRows += 1;
 
@@ -580,25 +625,33 @@ analyticsRouter.get('/customer-usage-comparison', async (req, res, next) => {
         folderId: report.folderId,
         cluster,
         workflowFolder,
-        usageBytes: String(report.usageSize),
+        usageBytes: String(usageBytes),
         usageGb: sizeGb,
         fileCount: report.fileCount || 0,
       };
       period.folders.push(folderRow);
 
       const clusterKey = cluster;
-      if (!clusterMap.has(clusterKey)) clusterMap.set(clusterKey, { cluster, periods: Object.fromEntries(periodKeys.map((k) => [k, { usageGb: 0, fileCount: 0 }])) });
-      clusterMap.get(clusterKey).periods[key].usageGb += sizeGb;
-      clusterMap.get(clusterKey).periods[key].fileCount += report.fileCount || 0;
+      if (!clusterMap.has(clusterKey)) clusterMap.set(clusterKey, { cluster, periods: Object.fromEntries(periodKeys.map((k) => [k, { usageBytes: '0', usageGb: 0, fileCount: 0 }])) });
+      const clusterPeriod = clusterMap.get(clusterKey).periods[key];
+      clusterPeriod.usageBytes = String(BigInt(clusterPeriod.usageBytes) + usageBytes);
+      clusterPeriod.fileCount += report.fileCount || 0;
 
       const folderKey = `${cluster}||${workflowFolder}`;
-      if (!folderMap.has(folderKey)) folderMap.set(folderKey, { cluster, workflowFolder, periods: Object.fromEntries(periodKeys.map((k) => [k, { usageGb: 0, fileCount: 0 }])) });
-      folderMap.get(folderKey).periods[key].usageGb += sizeGb;
-      folderMap.get(folderKey).periods[key].fileCount += report.fileCount || 0;
+      if (!folderMap.has(folderKey)) folderMap.set(folderKey, { cluster, workflowFolder, periods: Object.fromEntries(periodKeys.map((k) => [k, { usageBytes: '0', usageGb: 0, fileCount: 0 }])) });
+      const folderPeriod = folderMap.get(folderKey).periods[key];
+      folderPeriod.usageBytes = String(BigInt(folderPeriod.usageBytes) + usageBytes);
+      folderPeriod.fileCount += report.fileCount || 0;
     }
 
     for (const period of byPeriod.values()) {
+      period.totalUsageGb = bytesToGb(BigInt(period.totalUsageBytes));
       period.folders.sort((a, b) => a.cluster.localeCompare(b.cluster) || a.workflowFolder.localeCompare(b.workflowFolder));
+    }
+    for (const summary of [...clusterMap.values(), ...folderMap.values()]) {
+      for (const period of Object.values(summary.periods)) {
+        period.usageGb = bytesToGb(BigInt(period.usageBytes));
+      }
     }
 
     res.json({
@@ -632,7 +685,7 @@ analyticsRouter.get('/customer-yearly-summary', async (req, res, next) => {
     });
     if (!customer) return res.status(404).json({ error: 'Customer not found' });
 
-    const [availableYearRows, monthlyRows, reports] = await Promise.all([
+    const [availableYearRows, monthlyRows, billableMonthlyRows, reports] = await Promise.all([
       prisma.report.groupBy({
         by: ['year'],
         where: { custId, deletedAt: null },
@@ -645,48 +698,31 @@ analyticsRouter.get('/customer-yearly-summary', async (req, res, next) => {
         _count: { _all: true },
         orderBy: { month: 'asc' },
       }),
+      prisma.report.groupBy({
+        by: ['month'],
+        where: { custId, year, deletedAt: null, usageSize: billableUsageFilter() },
+        _sum: { usageSize: true },
+        orderBy: { month: 'asc' },
+      }),
       prisma.report.findMany({
         where: { custId, year, deletedAt: null },
         select: {
+          month: true,
           usageSize: true,
           fileCount: true,
+          pricePerGb: true,
           folderId: true,
           folder: { select: { folderName: true, department: { select: { deptName: true } } } },
         },
       }),
     ]);
 
-    const monthlyFacts = new Map(monthlyRows.map((row) => [row.month, row]));
-    const months = MONTHS.map((month) => {
-      const row = monthlyFacts.get(month);
-      const usageBytes = row?._sum.usageSize || 0n;
-      return {
-        year,
-        month,
-        usageBytes: String(usageBytes),
-        usageGb: bytesToGb(usageBytes),
-        fileCount: row?._sum.fileCount || 0,
-        reportRows: row?._count._all || 0,
-      };
+    const { months, clusters: clusterRows, workflowFolders: workflowFolderRows, totals } = buildCustomerYearlyMonths({
+      year,
+      monthlyRows,
+      billableMonthlyRows,
+      reports,
     });
-
-    const clusters = new Map();
-    const workflowFolders = new Map();
-    for (const report of reports) {
-      const usageBytes = BigInt(report.usageSize || 0n);
-      const fileCount = report.fileCount || 0;
-      const cluster = report.folder.department.deptName;
-      const workflowFolder = `${cluster} - ${report.folder.folderName}`;
-      const add = (map, key, identity) => {
-        const value = map.get(key) || { ...identity, usageBytes: 0n, fileCount: 0, reportRows: 0 };
-        value.usageBytes += usageBytes;
-        value.fileCount += fileCount;
-        value.reportRows += 1;
-        map.set(key, value);
-      };
-      add(clusters, cluster, { cluster });
-      add(workflowFolders, report.folderId, { cluster, workflowFolder });
-    }
 
     const formatSummary = (values) => values
       .map((value) => {
@@ -695,24 +731,16 @@ analyticsRouter.get('/customer-yearly-summary', async (req, res, next) => {
       })
       .sort((a, b) => b.usageGb - a.usageGb || a.cluster.localeCompare(b.cluster) || (a.workflowFolder || '').localeCompare(b.workflowFolder || ''));
 
-    const totalUsageBytes = months.reduce((sum, month) => sum + BigInt(month.usageBytes), 0n);
-    const totalFileCount = months.reduce((sum, month) => sum + month.fileCount, 0);
-    const totalReportRows = months.reduce((sum, month) => sum + month.reportRows, 0);
-
-    res.json({
+    const summary = {
       customer: { custId: customer.custId, name: customer.custName },
       selectedYear: year,
       availableYears: availableYearRows.map((row) => row.year),
-      totals: {
-        usageBytes: String(totalUsageBytes),
-        usageGb: bytesToGb(totalUsageBytes),
-        fileCount: totalFileCount,
-        reportRows: totalReportRows,
-      },
+      totals,
       months,
-      clusters: formatSummary([...clusters.values()]),
-      workflowFolders: formatSummary([...workflowFolders.values()]),
-    });
+      clusters: formatSummary(clusterRows),
+      workflowFolders: formatSummary(workflowFolderRows),
+    };
+    res.json(presentCustomerYearlySummary(summary, { includeFinancials: req.user?.role !== 'customer_viewer' }));
   } catch (err) {
     next(err);
   }
@@ -729,19 +757,26 @@ analyticsRouter.get('/report-availability', async (req, res, next) => {
 
     const resolvedCustId = await getEffectiveCustomerId(req);
 
-    const periods = await prisma.report.groupBy({
-      by: ['year', 'month'],
+    const reportRows = await prisma.report.findMany({
       where: { custId: resolvedCustId, deletedAt: null },
-      _count: { _all: true },
-      _sum: { usageSize: true },
+      select: { year: true, month: true, usageSize: true },
       orderBy: [{ year: 'desc' }, { month: 'desc' }],
     });
 
-    const availableMonths = periods.map((period) => ({
+    const periodMap = new Map();
+    for (const report of reportRows) {
+      const key = `${report.year}-${report.month}`;
+      const period = periodMap.get(key) || { year: report.year, month: report.month, reportRows: 0, totalUsageBytes: 0n };
+      period.reportRows += 1;
+      period.totalUsageBytes += billableUsageBytes(report.usageSize);
+      periodMap.set(key, period);
+    }
+
+    const availableMonths = [...periodMap.values()].map((period) => ({
       year: period.year,
       month: period.month,
-      reportRows: period._count._all,
-      totalUsageGb: bytesToGb(period._sum.usageSize || 0n),
+      reportRows: period.reportRows,
+      totalUsageGb: bytesToGb(period.totalUsageBytes),
     }));
 
     res.json({
@@ -779,30 +814,17 @@ analyticsRouter.get('/report-detail', async (req, res, next) => {
       ],
     });
 
-    // 2. Workfolder summary (grouped by folder)
-    const workfolderSummary = await prisma.report.groupBy({
-      by: ['folderId'],
-      where: { custId: resolvedCustId, month, year, deletedAt: null },
-      _sum: { usageSize: true },
-    });
-
-    const folderIds = workfolderSummary.map(w => w.folderId);
-    const folders = await prisma.folder.findMany({
-      where: { folderId: { in: folderIds } },
-      include: { department: { include: { customer: true } } },
-    });
-
-    // 3. Departmental summary
-    const deptSummary = await prisma.report.findMany({
-      where: { custId: resolvedCustId, month, year, deletedAt: null },
-      include: { folder: { include: { department: true } } },
-    });
-
+    // Apply the threshold to each path before building folder and cluster sums.
+    const workfolderMap = new Map();
     const deptMap = {};
-    for (const r of deptSummary) {
+    for (const r of reports) {
+      const usageBytes = billableUsageBytes(r.usageSize);
+      const workfolder = workfolderMap.get(r.folderId) || { folder: r.folder, usageBytes: 0n };
+      workfolder.usageBytes += usageBytes;
+      workfolderMap.set(r.folderId, workfolder);
       const deptName = r.folder.department.deptName;
       if (!deptMap[deptName]) deptMap[deptName] = 0n;
-      deptMap[deptName] += r.usageSize;
+      deptMap[deptName] += usageBytes;
     }
 
     // 4. Breakdown data
@@ -810,7 +832,7 @@ analyticsRouter.get('/report-detail', async (req, res, next) => {
       where: { custId: resolvedCustId, month, year },
     });
 
-    const [latestImport, pendingUnmatched, latestAvailable] = await Promise.all([
+    const [latestImport, pendingUnmatched, latestAvailable, lifecycle] = await Promise.all([
       prisma.importRun.findFirst({
         where: { custId: resolvedCustId, month: String(month), year: String(year) },
         orderBy: { createdAt: 'desc' },
@@ -819,19 +841,32 @@ analyticsRouter.get('/report-detail', async (req, res, next) => {
       prisma.unmatchedDirectory.count({
         where: { status: 'PENDING', importRun: { custId: resolvedCustId, month: String(month), year: String(year) } },
       }),
-      prisma.report.groupBy({
-        by: ['year', 'month'],
+      prisma.report.findFirst({
         where: { custId: resolvedCustId, deletedAt: null },
-        _count: { _all: true },
-        _sum: { usageSize: true },
+        select: { year: true, month: true },
         orderBy: [{ year: 'desc' }, { month: 'desc' }],
-        take: 1,
+      }),
+      prisma.reportPeriod.findUnique({
+        where: { custId_month_year: { custId: resolvedCustId, month: String(month).padStart(2, '0'), year: String(year) } },
       }),
     ]);
 
-    // Find MXFSERVER size for percentage calculation
+    const latestAvailableReports = latestAvailable
+      ? await prisma.report.findMany({
+        where: { custId: resolvedCustId, year: latestAvailable.year, month: latestAvailable.month, deletedAt: null },
+        select: { usageSize: true },
+      })
+      : [];
+    const latestAvailableUsage = latestAvailableReports.reduce((sum, report) => sum + billableUsageBytes(report.usageSize), 0n);
+    const reportTotalUsage = sumBillableUsageBytes(reports, (report) => report.usageSize);
+    const reportTotalRevenue = reports.reduce(
+      (sum, report) => sum + exactBillableUsageGb(report.usageSize) * Number(report.pricePerGb),
+      0,
+    );
+
+    // Find MXFSERVER billable size for percentage calculation.
     const mxfReport = reports.find(r => r.folder.folderShortName === 'MXFSERVER');
-    const mxfSize = mxfReport ? Number(mxfReport.usageSize) : 0;
+    const mxfSize = mxfReport ? Number(billableUsageBytes(mxfReport.usageSize)) : 0;
 
     const customer = await prisma.customer.findUnique({
       where: { custId: resolvedCustId },
@@ -843,7 +878,8 @@ analyticsRouter.get('/report-detail', async (req, res, next) => {
       month,
       year,
       meta: {
-        status: reports.length > 0 ? 'DRAFT' : 'EMPTY',
+        status: reports.length > 0 ? (lifecycle?.status || 'DRAFT') : 'EMPTY',
+        lifecycleVersion: lifecycle?.version || 1,
         rowCount: reports.length,
         breakdownRowCount: breakdowns.length,
         pendingUnmatched: req.user?.role === 'customer_viewer' ? 0 : pendingUnmatched,
@@ -858,39 +894,40 @@ analyticsRouter.get('/report-detail', async (req, res, next) => {
           createdAt: latestImport.createdAt,
           uploadedBy: latestImport.user?.fullname || latestImport.user?.username || 'Unknown',
         } : null,
-        latestAvailable: latestAvailable[0] ? {
-          year: latestAvailable[0].year,
-          month: latestAvailable[0].month,
-          reportRows: latestAvailable[0]._count._all,
-          totalUsageGb: bytesToGb(latestAvailable[0]._sum.usageSize || 0n),
+        latestAvailable: latestAvailable ? {
+          year: latestAvailable.year,
+          month: latestAvailable.month,
+          reportRows: latestAvailableReports.length,
+          totalUsageGb: bytesToGb(latestAvailableUsage),
         } : null,
       },
       isilon: reports.map(r => ({
         id: r.id,
         cluster: `${r.folder.department.customer.custName} ${r.folder.department.deptName}`,
         workflowFolder: `${r.folder.department.deptName} - ${r.folder.folderName}`,
-        sizeGb: Math.ceil(Number(r.usageSize) / 1073741824),
-        sizeBytes: String(r.usageSize),
+        sizeGb: bytesToGb(r.usageSize),
+        sizeBytes: String(billableUsageBytes(r.usageSize)),
         fileCount: r.fileCount,
       })),
-      totalUsageGb: reports.reduce((s, r) => s + Math.ceil(Number(r.usageSize) / 1073741824), 0),
-      workfolderSummary: workfolderSummary.map(w => {
-        const f = folders.find(fd => fd.folderId === w.folderId);
+      totalUsageGb: bytesToGb(reportTotalUsage),
+      totalRevenue: Math.round((reportTotalRevenue + Number.EPSILON) * 100) / 100,
+      workfolderSummary: [...workfolderMap.entries()].map(([folderId, summary]) => {
+        const f = summary.folder;
         return {
-          folderName: f ? `${f.department.deptName} - ${f.folderName}` : w.folderId,
-          sizeGb: Math.ceil(Number(w._sum.usageSize) / 1073741824),
+          folderName: f ? `${f.department.deptName} - ${f.folderName}` : folderId,
+          sizeGb: bytesToGb(summary.usageBytes),
         };
       }),
       departmentalSummary: Object.entries(deptMap).map(([name, size]) => ({
         deptName: name,
-        sizeGb: Math.ceil(Number(size) / 1073741824),
+        sizeGb: bytesToGb(size),
       })),
       breakdowns: breakdowns.map(b => ({
         unit: b.unit,
         usageSize: b.usageSize,
         percentage: mxfSize > 0 ? (1 - (b.usageSize / mxfSize)) * 100 : 0,
       })),
-      mxfServerSizeGb: mxfSize > 0 ? Math.ceil(mxfSize / 1073741824) : 0,
+      mxfServerSizeGb: bytesToGb(mxfSize),
     });
   } catch (err) {
     next(err);

@@ -24,7 +24,7 @@ export function requireAdmin(req, res, next) {
 }
 
 export function requireInternal(req, res, next) {
-  if (req.user?.role === 'customer_viewer') {
+  if (!['admin', 'user'].includes(req.user?.role)) {
     return res.status(403).json({ error: 'Internal access required' });
   }
   next();

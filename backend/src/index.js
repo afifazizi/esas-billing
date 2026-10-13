@@ -13,7 +13,12 @@ import { exportRouter } from './routes/exports.js';
 import { userRouter } from './routes/users.js';
 import { auditRouter } from './routes/audit.js';
 import { importRouter, unmatchedRouter } from './routes/imports.js';
+import { reportPeriodRouter } from './routes/reportPeriods.js';
+import { billingRouter } from './routes/billing.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { validateJwtConfiguration } from './utils/jwt.js';
+
+validateJwtConfiguration();
 
 const app = express();
 const PORT = process.env.PORT || 5050;
@@ -56,6 +61,8 @@ app.use('/api/users', userRouter);
 app.use('/api/audit-logs', auditRouter);
 app.use('/api/import-runs', importRouter);
 app.use('/api/unmatched-directories', unmatchedRouter);
+app.use('/api/report-periods', reportPeriodRouter);
+app.use('/api/billing', billingRouter);
 
 // ─── Health Check ───
 app.get('/api/health', (req, res) => {

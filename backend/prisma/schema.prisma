@@ -50,6 +50,7 @@ model Customer {
   breakdowns      Breakdown[]
   importRuns      ImportRun[]
   users           User[]
+  reportPeriods   ReportPeriod[]
 
   @@map("customer")
 }
@@ -211,4 +212,48 @@ model UnmatchedDirectory {
   @@index([importRunId])
   @@index([status])
   @@map("unmatched_directory")
+}
+
+// Period-level workflow state. Existing Report rows remain unchanged.
+model ReportPeriod {
+  id           String   @id @default(uuid())
+  custId       String
+  month        String
+  year         String
+  status       String   @default("DRAFT")
+  version      Int      @default(1)
+  reviewedById String?
+  reviewedAt   DateTime?
+  approvedById String?
+  approvedAt   DateTime?
+  lockedById   String?
+  lockedAt     DateTime?
+  reopenedById String?
+  reopenedAt   DateTime?
+  reopenReason String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  customer     Customer @relation(fields: [custId], references: [custId], onDelete: Restrict)
+  transitions  ReportPeriodTransition[]
+
+  @@unique([custId, month, year])
+  @@index([status, year, month])
+  @@map("report_period")
+}
+
+model ReportPeriodTransition {
+  id             String   @id @default(uuid())
+  reportPeriodId String
+  fromStatus     String
+  toStatus       String
+  version        Int
+  actorId        String
+  reason         String?
+  createdAt      DateTime @default(now())
+
+  reportPeriod   ReportPeriod @relation(fields: [reportPeriodId], references: [id], onDelete: Restrict)
+
+  @@index([reportPeriodId, createdAt])
+  @@map("report_period_transition")
 }

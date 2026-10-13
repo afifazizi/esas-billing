@@ -5,11 +5,13 @@ function getBaseURL(): string {
   if (process.env.NEXT_PUBLIC_API_URL) {
     return process.env.NEXT_PUBLIC_API_URL;
   }
-  // Runtime detection: use same hostname as the frontend, port 5050
+  // Runtime detection: public/staging deployments expose the API through the
+  // same reverse proxy as the frontend. Do not require browsers to reach the
+  // backend service port directly.
   if (typeof window !== 'undefined') {
     const host = window.location.hostname;
     if (host && host !== 'localhost') {
-      return `http://${host}:5050/api`;
+      return '/api';
     }
   }
   return 'http://localhost:5050/api';

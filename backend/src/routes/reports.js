@@ -5,26 +5,21 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import prisma from '../db.js';
-import { authenticate, customerViewerBlocked } from '../middleware/auth.js';
+import { authenticate, requireInternal } from '../middleware/auth.js';
 import { uploadCsv } from '../middleware/upload.js';
 import { z } from 'zod';
-import { auditLog } from '../utils/audit.js';
+import { assertPeriodMutable } from '../services/reportLifecycle.js';
+import { softDeleteReports, validateBulkDeleteInput } from '../services/reportDeletion.js';
+import { commitUploadPreviewTransaction, repriceReportsTransaction, softDeleteReportTransaction } from '../services/reportMutations.js';
+import { createPreviewStore } from '../services/uploadPreviewStore.js';
+import { billableUsageBytes, billableUsageGb } from '../utils/usageThreshold.js';
 
 export const reportRouter = Router();
 reportRouter.use(authenticate);
-reportRouter.use((req, res, next) => {
-  if (req.method !== 'GET' && req.user?.role === 'customer_viewer') {
-    return res.status(403).json({ error: 'Customer users are read-only' });
-  }
-  next();
-});
 
 const PREVIEW_DIR = path.join(os.tmpdir(), 'esas-upload-previews');
 const PREVIEW_TTL_MS = 60 * 60 * 1000;
-
-function ensurePreviewDir() {
-  fs.mkdirSync(PREVIEW_DIR, { recursive: true });
-}
+const previewStore = createPreviewStore({ directory: PREVIEW_DIR, ttlMs: PREVIEW_TTL_MS });
 
 function parseReportParams(body) {
   const custId = body.paramCustID || body.custId;
@@ -76,10 +71,6 @@ function parseBigIntSafe(value) {
   return BigInt(digits.slice(0, digits.length - decimalPlaces));
 }
 
-function bytesToGb(bytes) {
-  return Math.ceil(Number(bytes || 0n) / 1073741824);
-}
-
 async function resolveCustomerId(custId) {
   const requested = String(custId || '').trim();
   if (!requested) return requested;
@@ -97,54 +88,13 @@ async function resolveCustomerId(custId) {
   return customers.find((customer) => customer.custId.toLowerCase() === requested.toLowerCase())?.custId || requested;
 }
 
-function previewFilePath(previewId) {
-  if (!/^[a-f0-9-]{36}$/.test(previewId)) {
-    const err = new Error('Invalid previewId');
-    err.status = 400;
-    throw err;
-  }
-  return path.join(PREVIEW_DIR, `${previewId}.json`);
-}
-
-function savePreview(preview) {
-  ensurePreviewDir();
-  const previewId = crypto.randomUUID();
-  const saved = { ...preview, previewId, createdAt: new Date().toISOString() };
-  fs.writeFileSync(previewFilePath(previewId), JSON.stringify(saved));
-  return saved;
-}
-
-function loadPreview(previewId) {
-  const filePath = previewFilePath(previewId);
-  if (!fs.existsSync(filePath)) {
-    const err = new Error('Preview has expired or does not exist. Generate a new preview.');
-    err.status = 404;
-    throw err;
-  }
-  const preview = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-  if (Date.now() - new Date(preview.createdAt).getTime() > PREVIEW_TTL_MS) {
-    fs.unlinkSync(filePath);
-    const err = new Error('Preview has expired. Generate a new preview.');
-    err.status = 410;
-    throw err;
-  }
-  return preview;
-}
-
-function removePreview(previewId) {
-  try {
-    fs.unlinkSync(previewFilePath(previewId));
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-  }
-}
-
 function findColumn(header, needle) {
   return header.findIndex((h) => String(h).trim().toLowerCase().includes(needle));
 }
 
-async function buildUploadPreview({ filePath, originalName, body }) {
+async function buildUploadPreview({ filePath, originalName, body, creatorUserId }) {
   const { custId, year, month } = parseReportParams(body);
+  await assertPeriodMutable(prisma, { custId, month, year });
   const priceId = body.priceId || body.price_id || null;
   const fileContent = fs.readFileSync(filePath, 'utf-8');
   const fileHash = crypto.createHash('sha1').update(fileContent).digest('hex');
@@ -177,6 +127,7 @@ async function buildUploadPreview({ filePath, originalName, body }) {
 
   let skippedCount = 0;
   let duplicateCount = 0;
+  let belowThresholdCount = 0;
   let estimatedBytes = 0n;
   let resolvedPriceId = null;
 
@@ -192,7 +143,9 @@ async function buildUploadPreview({ filePath, originalName, body }) {
 
       const directoryPath = String(row[0]).trim();
       const folderShortName = directoryPath.substring(directoryPath.lastIndexOf('/') + 1);
-      const sizeBytes = parseBigIntSafe(row[colPhysCount]);
+      const rawSizeBytes = parseBigIntSafe(row[colPhysCount]);
+      const sizeBytes = billableUsageBytes(rawSizeBytes);
+      if (rawSizeBytes > 0n && sizeBytes === 0n) belowThresholdCount++;
       const dirCount = parseIntSafe(row[colDirCount]);
       const fileCount = parseIntSafe(row[colFileCount]);
       const adsCount = parseIntSafe(row[colAdsCount]);
@@ -202,7 +155,7 @@ async function buildUploadPreview({ filePath, originalName, body }) {
       const baseRow = {
         rowNumber,
         directoryPath,
-        usageGb: bytesToGb(sizeBytes),
+        usageGb: billableUsageGb(sizeBytes),
       };
 
       const candidateFolders = await prisma.folder.findMany({
@@ -288,8 +241,9 @@ async function buildUploadPreview({ filePath, originalName, body }) {
   if (unmatchedRows.length > 0) warnings.push(`${unmatchedRows.length} unmatched paths will be queued for review.`);
   if (duplicateCount > 0) warnings.push(`${duplicateCount} duplicate rows will be skipped.`);
   if (skippedCount > 0) warnings.push(`${skippedCount} rows were skipped before matching.`);
+  if (belowThresholdCount > 0) warnings.push(`${belowThresholdCount} path${belowThresholdCount === 1 ? '' : 's'} at or below 1 GB will be recorded as 0 usage.`);
 
-  return savePreview({
+  return previewStore.save({
     fileHash,
     fileName: originalName,
     month,
@@ -301,14 +255,15 @@ async function buildUploadPreview({ filePath, originalName, body }) {
     unmatchedCount: unmatchedRows.length,
     skippedCount,
     duplicateCount,
+    belowThresholdCount,
     estimatedUsageBytes: String(estimatedBytes),
-    estimatedUsageGb: bytesToGb(estimatedBytes),
+    estimatedUsageGb: billableUsageGb(estimatedBytes),
     errors,
     warnings,
     rows: rows.slice(0, 100),
     matchedRows,
     unmatchedRows,
-  });
+  }, creatorUserId);
 }
 
 async function commitUploadPreview(preview, req) {
@@ -317,95 +272,10 @@ async function commitUploadPreview(preview, req) {
     err.status = 400;
     throw err;
   }
-
-  let importRun;
-  let insertedCount = 0;
-  let skippedCount = Number(preview.skippedCount || 0) + Number(preview.duplicateCount || 0);
-
-  await prisma.$transaction(async (tx) => {
-    for (const row of preview.matchedRows || []) {
-      const duplicate = await tx.report.findFirst({
-        where: {
-          folderId: row.folderId,
-          month: preview.month,
-          year: preview.year,
-          fileHash: preview.fileHash,
-          deletedAt: null,
-        },
-      });
-      if (duplicate) {
-        skippedCount++;
-        continue;
-      }
-
-      await tx.report.create({
-        data: {
-          folderId: row.folderId,
-          usageSize: BigInt(row.sizeBytes),
-          month: preview.month,
-          year: preview.year,
-          pricePerGb: row.pricePerGb,
-          priceId: preview.priceId || null,
-          fileHash: preview.fileHash,
-          fileName: preview.fileName.replace(/\.csv$/i, ''),
-          folderDir: row.directoryPath,
-          dirCount: row.dirCount,
-          fileCount: row.fileCount,
-          adsCount: row.adsCount,
-          otherCount: row.otherCount,
-          custId: preview.custId,
-        },
-      });
-      insertedCount++;
-    }
-
-    importRun = await tx.importRun.create({
-      data: {
-        userId: req.user.id,
-        fileName: preview.fileName,
-        fileHash: preview.fileHash,
-        month: preview.month,
-        year: preview.year,
-        custId: preview.custId,
-        matchedCount: Number(preview.matchedCount || 0),
-        unmatchedCount: Number(preview.unmatchedCount || 0),
-        insertedCount,
-        skippedCount,
-        status: Number(preview.unmatchedCount || 0) > 0 ? 'PARTIAL' : 'SUCCESS',
-      },
-    });
-
-    for (const row of preview.unmatchedRows || []) {
-      await tx.unmatchedDirectory.create({
-        data: {
-          importRunId: importRun.id,
-          directoryPath: row.directoryPath,
-          sizeBytes: BigInt(row.sizeBytes),
-          fileCount: row.fileCount,
-          status: 'PENDING',
-        },
-      });
-    }
+  const { importRun, insertedCount, skippedCount } = await commitUploadPreviewTransaction(prisma, {
+    preview,
+    actor: { id: req.user.id, ipAddress: req.ip, userAgent: req.headers['user-agent'] },
   });
-
-  await auditLog({
-    userId: req.user.id,
-    action: 'UPLOAD_REPORT',
-    entityType: 'ImportRun',
-    entityId: importRun.id,
-    newValue: {
-      fileName: preview.fileName,
-      custId: preview.custId,
-      month: preview.month,
-      year: preview.year,
-      matched: preview.matchedCount,
-      unmatched: preview.unmatchedCount,
-      inserted: insertedCount,
-      skipped: skippedCount,
-    },
-    req,
-  });
-
   return {
     message: 'CSV import confirmed',
     importRunId: importRun.id,
@@ -423,7 +293,7 @@ async function commitUploadPreview(preview, req) {
 
 // ─── Isilon CSV Upload Wizard ───
 // POST /api/reports/upload/preview — parse only, no DB writes
-reportRouter.post('/upload/preview', uploadCsv.single('file_name'), async (req, res, next) => {
+reportRouter.post('/upload/preview', requireInternal, uploadCsv.single('file_name'), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'CSV file is required' });
@@ -432,6 +302,7 @@ reportRouter.post('/upload/preview', uploadCsv.single('file_name'), async (req, 
       filePath: req.file.path,
       originalName: req.file.originalname,
       body: req.body,
+      creatorUserId: req.user.id,
     });
     fs.unlinkSync(req.file.path);
     res.json(preview);
@@ -442,19 +313,19 @@ reportRouter.post('/upload/preview', uploadCsv.single('file_name'), async (req, 
 });
 
 // POST /api/reports/upload/confirm — commit a previously reviewed preview
-reportRouter.post('/upload/confirm', async (req, res, next) => {
+reportRouter.post('/upload/confirm', requireInternal, async (req, res, next) => {
   try {
     const { previewId, fileHash, custId, paramCustID, month, year } = req.body;
     if (!previewId) return res.status(400).json({ error: 'previewId is required' });
 
-    const preview = loadPreview(previewId);
+    const preview = previewStore.load(previewId, req.user.id);
     if (fileHash && fileHash !== preview.fileHash) return res.status(409).json({ error: 'Preview file hash mismatch' });
     if ((custId || paramCustID) && (custId || paramCustID) !== preview.custId) return res.status(409).json({ error: 'Preview customer mismatch' });
     if (month && String(month).padStart(2, '0') !== preview.month) return res.status(409).json({ error: 'Preview month mismatch' });
     if (year && String(year) !== preview.year) return res.status(409).json({ error: 'Preview year mismatch' });
 
     const result = await commitUploadPreview(preview, req);
-    removePreview(previewId);
+    previewStore.remove(previewId);
     res.json(result);
   } catch (err) {
     next(err);
@@ -463,7 +334,7 @@ reportRouter.post('/upload/confirm', async (req, res, next) => {
 
 // ─── Legacy direct Isilon CSV Upload ───
 // POST /api/reports/upload — kept for backward compatibility; internally previews then confirms
-reportRouter.post('/upload', uploadCsv.single('file_name'), async (req, res, next) => {
+reportRouter.post('/upload', requireInternal, uploadCsv.single('file_name'), async (req, res, next) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: 'CSV file is required' });
@@ -472,14 +343,15 @@ reportRouter.post('/upload', uploadCsv.single('file_name'), async (req, res, nex
       filePath: req.file.path,
       originalName: req.file.originalname,
       body: req.body,
+      creatorUserId: req.user.id,
     });
     fs.unlinkSync(req.file.path);
     if (preview.errors.length > 0) {
-      removePreview(preview.previewId);
+      previewStore.remove(preview.previewId);
       return res.status(400).json({ error: preview.errors[0], errors: preview.errors });
     }
     const result = await commitUploadPreview(preview, req);
-    removePreview(preview.previewId);
+    previewStore.remove(preview.previewId);
     res.json({ message: 'CSV processed', processed: result.processed, skipped: result.skipped, fileHash: result.fileHash });
   } catch (err) {
     if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
@@ -489,7 +361,7 @@ reportRouter.post('/upload', uploadCsv.single('file_name'), async (req, res, nex
 
 // ─── Breakdown CSV Upload (CSV2 — MXFSERVER) ───
 // POST /api/reports/upload-breakdown
-reportRouter.post('/upload-breakdown', uploadCsv.single('file_name'), async (req, res, next) => {
+reportRouter.post('/upload-breakdown', requireInternal, uploadCsv.single('file_name'), async (req, res, next) => {
   try {
     const { reportDate, paramCustID: custId } = req.body;
     if (!reportDate || !custId) {
@@ -500,6 +372,7 @@ reportRouter.post('/upload-breakdown', uploadCsv.single('file_name'), async (req
     }
 
     const [yearString, monthString] = reportDate.split('-');
+    await assertPeriodMutable(prisma, { custId, month: monthString, year: yearString });
     const fileContent = fs.readFileSync(req.file.path, 'utf-8');
 
     const records = parse(fileContent, {
@@ -562,7 +435,7 @@ const repriceSchema = z.object({
 });
 
 // PUT /api/reports/reprice — retroactively change price tier for reports
-reportRouter.put('/reprice', async (req, res, next) => {
+reportRouter.put('/reprice', requireInternal, async (req, res, next) => {
   try {
     // Graceful validation — return 400 instead of crashing on missing/undefined fields
     const parsed = repriceSchema.safeParse(req.body);
@@ -571,33 +444,33 @@ reportRouter.put('/reprice', async (req, res, next) => {
       return res.status(400).json({ error: `Validation failed: ${messages}` });
     }
     const { custId, month, year, priceId } = parsed.data;
-
-    const tier = await prisma.price.findUnique({ where: { id: priceId } });
-    if (!tier) {
-      return res.status(404).json({ error: 'Price tier not found' });
-    }
-    if (tier.custId !== custId) {
-      return res.status(400).json({ error: 'Price tier does not belong to this customer' });
-    }
-
-    const result = await prisma.report.updateMany({
-      where: { custId, month, year, deletedAt: null },
-      data: { pricePerGb: tier.price, priceId: tier.id },
+    const result = await repriceReportsTransaction(prisma, {
+      custId,
+      month,
+      year,
+      priceId,
+      actor: { id: req.user.id, ipAddress: req.ip, userAgent: req.headers['user-agent'] },
     });
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
 
-    await auditLog({
-      userId: req.user.id,
-      action: 'REPRICE_REPORTS',
-      entityType: 'Report',
-      entityId: custId,
-      newValue: { custId, month, year, priceId, pricePerGb: tier.price, updated: result.count },
-      req,
+// DELETE /api/reports/bulk — atomically soft-delete selected rows from one report period
+reportRouter.delete('/bulk', requireInternal, async (req, res, next) => {
+  try {
+    const input = validateBulkDeleteInput(req.body);
+    const result = await softDeleteReports(prisma, {
+      ...input,
+      custId: await resolveCustomerId(input.custId),
+      actorId: req.user.id,
+      ipAddress: req.ip,
+      userAgent: req.headers['user-agent'],
     });
-
     res.json({
-      updated: result.count,
-      pricePerGb: tier.price,
-      priceLabel: tier.label || '',
+      message: `${result.deleted} report row${result.deleted === 1 ? '' : 's'} removed`,
+      ...result,
     });
   } catch (err) {
     next(err);
@@ -638,8 +511,8 @@ reportRouter.get('/', async (req, res, next) => {
       folder_dir: r.folderDir,
       department: r.folder.department.deptName,
       customer: r.folder.department.customer.custName,
-      usage_gb: Math.ceil(Number(r.usageSize) / 1073741824),
-      usage_bytes: String(r.usageSize),
+      usage_gb: billableUsageGb(r.usageSize),
+      usage_bytes: String(billableUsageBytes(r.usageSize)),
       dir_count: r.dirCount,
       file_count: r.fileCount,
       month: r.month,
@@ -653,16 +526,12 @@ reportRouter.get('/', async (req, res, next) => {
 });
 
 // DELETE /api/reports/:id (soft delete)
-reportRouter.delete('/:id', async (req, res, next) => {
+reportRouter.delete('/:id', requireInternal, async (req, res, next) => {
   try {
-    const report = await prisma.report.findUnique({ where: { id: req.params.id } });
-    if (!report) return res.status(404).json({ error: 'Report not found' });
-
-    await prisma.report.update({
-      where: { id: req.params.id },
-      data: { deletedAt: new Date() },
+    await softDeleteReportTransaction(prisma, {
+      reportId: req.params.id,
+      actor: { id: req.user.id, ipAddress: req.ip, userAgent: req.headers['user-agent'] },
     });
-
     res.json({ message: 'Report soft-deleted' });
   } catch (err) {
     next(err);

@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import prisma from '../db.js';
-import { authenticate, customerViewerBlocked } from '../middleware/auth.js';
+import { authenticate, requireInternal } from '../middleware/auth.js';
 import { generateDeptId } from '../utils/generateId.js';
 import { z } from 'zod';
 
 export const departmentRouter = Router();
 departmentRouter.use(authenticate);
-departmentRouter.use(customerViewerBlocked);
+departmentRouter.use(requireInternal);
 
 const deptSchema = z.object({
   dept_id: z.string().min(1).max(255).optional(),

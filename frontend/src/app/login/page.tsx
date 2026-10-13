@@ -88,7 +88,7 @@ export default function LoginPage() {
             </button>
           </form>
         </div>
-        <p className="text-center text-xs text-[var(--color-faint)] mt-6">ESAS Billing v2.0 — Staging</p>
+        <p className="text-center text-xs text-[var(--color-faint)] mt-6">ESAS Billing v3.0</p>
       </div>
     </div>
   );

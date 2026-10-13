@@ -1,12 +1,12 @@
 import { Router } from 'express';
 import prisma from '../db.js';
-import { authenticate, customerViewerBlocked } from '../middleware/auth.js';
+import { authenticate, requireInternal } from '../middleware/auth.js';
 import { generateFolderId } from '../utils/generateId.js';
 import { z } from 'zod';
 
 export const folderRouter = Router();
 folderRouter.use(authenticate);
-folderRouter.use(customerViewerBlocked);
+folderRouter.use(requireInternal);
 
 // GET /api/folders — global list for admin mapping dropdowns
 folderRouter.get('/', async (req, res, next) => {

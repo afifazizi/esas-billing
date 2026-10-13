@@ -1,13 +1,13 @@
 import { Router } from 'express';
 import prisma from '../db.js';
-import { authenticate, customerViewerBlocked } from '../middleware/auth.js';
+import { authenticate, requireInternal } from '../middleware/auth.js';
 import { auditLog } from '../utils/audit.js';
 import { generateCustId } from '../utils/generateId.js';
 import { z } from 'zod';
 
 export const customerRouter = Router();
 customerRouter.use(authenticate);
-customerRouter.use(customerViewerBlocked);
+customerRouter.use(requireInternal);
 
 async function resolveCustomerId(custId) {
   const requested = String(custId || '').trim();

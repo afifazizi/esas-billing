@@ -16,12 +16,14 @@ import {
   Link2Off,
   BarChart3,
   GitCompareArrows,
+  ClipboardCheck,
 } from 'lucide-react';
 import { ThemeToggle } from './ThemeToggle';
 import { BrandLogo } from '@/components/BrandLogo';
 
 const internalNavItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard, exact: true },
+  { href: '/dashboard/billing', label: 'Billing Operations', icon: ClipboardCheck },
   { href: '/dashboard/customers', label: 'Customer Management', icon: FolderTree },
   { href: '/dashboard/reports', label: 'Reports', icon: FileBarChart },
   { href: '/dashboard/import-runs', label: 'Import History', icon: UploadCloud },
